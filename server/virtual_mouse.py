@@ -21,13 +21,14 @@ GESTURES
     ✌  Index+Middle up, move hand  →  Scroll (hand up = up, down = down)
     ✊  Full fist (no pinch)         →  Pause cursor
 
-KEYBOARD  (OpenCV window must have focus)
+KEYBOARD  (type in the terminal while running)
     Q / ESC  →  Quit
     P        →  Pause / Resume
     +  / =   →  Sensitivity up
     -        →  Sensitivity down
     S        →  Toggle stats
     F        →  Toggle always-on-top
+    C        →  Toggle click-through (so you can click other apps freely)
 
 FAIL-SAFE
     Slam mouse to TOP-LEFT screen corner to abort pyautogui.
@@ -37,9 +38,11 @@ FAIL-SAFE
 import argparse
 import ctypes
 import math
+import msvcrt
 import os
 import sys
 import time
+import threading
 
 import cv2
 import numpy as np
@@ -362,6 +365,31 @@ def set_topmost(win_name: str, on: bool):
         pass
 
 
+def set_click_through(win_name: str, on: bool):
+    """
+    Make the OpenCV window transparent to mouse clicks (WS_EX_TRANSPARENT).
+    When on=True  → all mouse events pass through the window to whatever is below.
+    When on=False → normal window (can be clicked / focused).
+    This lets users interact with Chrome, File Explorer etc. even while the
+    overlay is floating above them.
+    """
+    try:
+        GWL_EXSTYLE      = -20
+        WS_EX_LAYERED    = 0x00080000
+        WS_EX_TRANSPARENT = 0x00000020
+        hwnd = ctypes.windll.user32.FindWindowW(None, win_name)
+        if not hwnd:
+            return
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if on:
+            style |=  (WS_EX_LAYERED | WS_EX_TRANSPARENT)
+        else:
+            style &= ~WS_EX_TRANSPARENT
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+    except Exception:
+        pass
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Model download helper
 # ══════════════════════════════════════════════════════════════════════════════
@@ -432,12 +460,31 @@ def run(sensitivity, alpha, scroll_speed, cam_idx):
     paused     = False
     show_stats = True
     topmost    = True
+    click_thru = True   # click-through ON by default so other apps still work
     fps_cnt    = 0
     fps_t      = time.perf_counter()
     fps_val    = 0
     conf       = 0
     gesture    = GSM.NONE
     frame_ms   = 0   # monotonic timestamp sent to MediaPipe
+
+    # ── Key state shared between background key-reader and main loop ─────────
+    # Using msvcrt (non-blocking) in a thread avoids cv2.waitKey stealing focus
+    _key_queue = []
+    _key_lock  = threading.Lock()
+    _running   = [True]
+
+    def _key_reader():
+        """Background thread: reads keys via msvcrt without stealing focus."""
+        while _running[0]:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                with _key_lock:
+                    _key_queue.append(ch.lower() if ch.isprintable() else ch)
+            time.sleep(0.02)
+
+    key_thread = threading.Thread(target=_key_reader, daemon=True)
+    key_thread.start()
 
     # ── Small always-on-top mini window pinned to top-right corner ───────────
     WIN_W, WIN_H = 320, 240         # compact overlay size
@@ -452,6 +499,7 @@ def run(sensitivity, alpha, scroll_speed, cam_idx):
 
     cv2.waitKey(80)                 # let window appear before SetWindowPos
     set_topmost(WIN, topmost)
+    set_click_through(WIN, click_thru)
 
     print()
     print("=" * 60)
@@ -470,6 +518,17 @@ def run(sensitivity, alpha, scroll_speed, cam_idx):
     print("    Hold pinch 0.8 s     → Drag & drop")
     print("    Index+Middle V up    → Scroll (move hand up / down)")
     print("    Full fist            → Pause cursor")
+    print()
+    print("  HOTKEYS (type in this terminal window):")
+    print("    Q / ESC  →  Quit")
+    print("    P        →  Pause / Resume")
+    print("    + / -    →  Sensitivity up / down")
+    print("    F        →  Toggle always-on-top")
+    print("    C        →  Toggle click-through")
+    print("               (ON = overlay never blocks other apps)")
+    print()
+    print("  CLICK-THROUGH is ON by default — the mini overlay")
+    print("  floats above everything but NEVER steals clicks or focus.")
     print()
     print("  FAIL-SAFE: slam mouse to TOP-LEFT corner to abort.")
     print("=" * 60)
@@ -551,29 +610,49 @@ def run(sensitivity, alpha, scroll_speed, cam_idx):
         draw_flash(frame, gesture)
         cv2.imshow(WIN, frame)
 
-        # ── Keys ─────────────────────────────────────────────────────────────
-        key = cv2.waitKey(1) & 0xFF
-        if   key in (ord('q'), ord('Q'), 27): break
-        elif key in (ord('p'), ord('P')):
-            paused = not paused
-            if paused:
-                gsm.cleanup()       # release any held mouse button
-                latest["landmarks"] = None
-            print(f"  {'PAUSED' if paused else 'RESUMED'}")
-        elif key in (ord('+'), ord('=')):
-            mapper.sensitivity = min(4.0, round(mapper.sensitivity + 0.1, 1))
-            print(f"  Sensitivity → {mapper.sensitivity}")
-        elif key == ord('-'):
-            mapper.sensitivity = max(0.3, round(mapper.sensitivity - 0.1, 1))
-            print(f"  Sensitivity → {mapper.sensitivity}")
-        elif key in (ord('s'), ord('S')):
-            show_stats = not show_stats
-        elif key in (ord('f'), ord('F')):
-            topmost = not topmost
-            set_topmost(WIN, topmost)
-            print(f"  Always-on-top: {'ON' if topmost else 'OFF'}")
+        # ── Keys (read from background thread — no focus stealing) ───────────
+        # cv2.waitKey(1) is still called to pump the OpenCV event loop
+        # (needed for imshow to render) but we do NOT use its return value
+        # for hotkeys, so the window never needs to be focused.
+        cv2.waitKey(1)
+
+        with _key_lock:
+            keys = _key_queue[:]
+            _key_queue.clear()
+
+        for ch in keys:
+            if   ch in ('q', '\x1b'):        # Q or ESC
+                _running[0] = False
+                gsm.cleanup(); landmarker.close(); cap.release()
+                cv2.destroyAllWindows()
+                print("\n  VirtualMouse stopped.")
+                sys.exit(0)
+            elif ch == 'p':
+                paused = not paused
+                if paused:
+                    gsm.cleanup()
+                    latest["landmarks"] = None
+                print(f"  {'PAUSED' if paused else 'RESUMED'}")
+            elif ch in ('+', '='):
+                mapper.sensitivity = min(4.0, round(mapper.sensitivity + 0.1, 1))
+                print(f"  Sensitivity → {mapper.sensitivity}")
+            elif ch == '-':
+                mapper.sensitivity = max(0.3, round(mapper.sensitivity - 0.1, 1))
+                print(f"  Sensitivity → {mapper.sensitivity}")
+            elif ch == 's':
+                show_stats = not show_stats
+            elif ch == 'f':
+                topmost = not topmost
+                set_topmost(WIN, topmost)
+                print(f"  Always-on-top: {'ON' if topmost else 'OFF'}")
+            elif ch == 'c':
+                # Toggle click-through so you can interact with the overlay itself
+                click_thru = not click_thru
+                set_click_through(WIN, click_thru)
+                print(f"  Click-through: {'ON (overlay transparent to clicks)' if click_thru else 'OFF (overlay clickable)'}")
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
+    _running[0] = False
     gsm.cleanup()
     landmarker.close()
     cap.release()
