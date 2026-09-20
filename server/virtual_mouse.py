@@ -18,7 +18,7 @@ GESTURES
     🤏  Thumb+Index pinch, release  →  Left click
     🤞  Thumb+Middle pinch, release →  Right click
     ✊  Hold left pinch 0.8s        →  Drag & drop (release to drop)
-    ✌  Index+Middle up, move hand  →  Scroll (hand up = up, down = down)
+    ✌  Middle+Ring up, move hand   →  Scroll (hand up = up, down = down)
     ✊  Full fist (no pinch)         →  Pause cursor
 
 KEYBOARD  (type in the terminal while running)
@@ -43,10 +43,31 @@ import os
 import sys
 import time
 import threading
+from collections import Counter, deque
 
 import cv2
 import numpy as np
 import pyautogui
+
+from config import (
+    CAMERA_INDEX,
+    DEBUG_MODE,
+    DEAD_ZONE,
+    DRAG_HOLD_SECONDS,
+    DRAG_THRESHOLD,
+    GESTURE_STABLE_FRAMES,
+    MIN_DETECTION_CONFIDENCE,
+    MIN_TRACKING_CONFIDENCE,
+    MOVE,
+    MOVEMENT_SENSITIVITY,
+    PAUSE_ON_OPEN_PALM,
+    PINCH_RELEASE_THRESHOLD,
+    PINCH_START_THRESHOLD,
+    SCROLL_COOLDOWN,
+    SCROLL_THRESHOLD,
+    SENSITIVITY,
+    SMOOTHING_FACTOR,
+)
 
 # ── MediaPipe 0.10 Tasks API ──────────────────────────────────────────────────
 import mediapipe as mp
@@ -104,19 +125,70 @@ def to_px(lm, w, h):
     return int(lm.x * w), int(lm.y * h)
 
 
+def send_windows_wheel(delta_steps: int, debug: bool = False):
+    """Send a genuine Windows OS wheel event to the foreground app."""
+    if delta_steps == 0:
+        if debug:
+            print("[SCROLL 9] Wheel event function called: FALSE")
+            print("[SCROLL 10] Windows wheel event sent: FALSE")
+        return False
+
+    wheel_delta = int(delta_steps * 120)
+    if debug:
+        print(f"[SCROLL 8] Calculated wheel amount: {delta_steps} steps -> {wheel_delta} wheel delta")
+        print("[SCROLL 9] Wheel event function called: TRUE")
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", ctypes.c_long),
+            ("dy", ctypes.c_long),
+            ("mouseData", ctypes.c_ulong),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.c_void_p),
+        ]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_ulong),
+            ("mi", MOUSEINPUT),
+        ]
+
+    MOUSEEVENTF_WHEEL = 0x0800
+    input_struct = INPUT()
+    input_struct.type = 0
+    input_struct.mi.dx = 0
+    input_struct.mi.dy = 0
+    input_struct.mi.mouseData = ctypes.c_ulong(wheel_delta).value
+    input_struct.mi.dwFlags = MOUSEEVENTF_WHEEL
+    input_struct.mi.time = 0
+    input_struct.mi.dwExtraInfo = None
+
+    sent = ctypes.windll.user32.SendInput(1, ctypes.byref(input_struct), ctypes.sizeof(INPUT))
+    ok = sent == 1
+    if debug:
+        print(f"[SCROLL 10] Windows wheel event sent: {ok}")
+    return ok
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # EMA smoother
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Smoother:
-    def __init__(self, alpha: float = 0.20):
-        self.alpha = max(0.05, min(1.0, alpha))
+    def __init__(self, alpha: float = None, deadzone: float = None):
+        self.alpha = max(0.05, min(1.0, float(alpha if alpha is not None else SMOOTHING_FACTOR)))
+        self.deadzone = float(deadzone if deadzone is not None else DEAD_ZONE)
         self.x = float(SCREEN_W) / 2
         self.y = float(SCREEN_H) / 2
 
     def update(self, tx, ty):
-        self.x += self.alpha * (tx - self.x)
-        self.y += self.alpha * (ty - self.y)
+        dx = tx - self.x
+        dy = ty - self.y
+        if abs(dx) < self.deadzone and abs(dy) < self.deadzone:
+            return self.x, self.y
+        self.x += self.alpha * dx
+        self.y += self.alpha * dy
         return self.x, self.y
 
 
@@ -130,9 +202,9 @@ class Mapper:
     After cv2.flip(frame,1) the landmark x values are already correct
     (0 = left of screen, 1 = right) — NO extra x inversion needed.
     """
-    def __init__(self, sensitivity: float = 1.5,
+    def __init__(self, sensitivity: float = None,
                  margin: float = 0.10):
-        self.sensitivity = sensitivity
+        self.sensitivity = float(sensitivity if sensitivity is not None else SENSITIVITY)
         self.m = margin
 
     def map(self, lx: float, ly: float):
@@ -155,113 +227,229 @@ class Mapper:
 
 class GSM:
     """
-    Priority order (no conflicts):
-      1. FIST   → Pause  (all curled, no pinch)
-      2. SCROLL → Scroll (index+middle up, ring/pinky down, no pinch)
-      3. DRAG   → Drag   (left pinch held ≥ DRAG_S)
-      4. LCLK   → Left click on pinch release
-      5. RCLK   → Right click on pinch release
-      6. MOVE   → Default
+    Stabilized gesture recognizer using normalized distances, temporal filtering,
+    hysteresis, and a small state machine so clicks and drags are not repeated.
     """
-    P_ENTER  = 0.050   # pinch-in threshold
-    P_EXIT   = 0.078   # pinch-out threshold (hysteresis)
-    DRAG_S   = 0.80    # seconds to enter drag mode
-    CLICK_CD = 0.55    # click cooldown seconds
-    SCRL_CD  = 0.07    # scroll step cooldown seconds
+    P_ENTER = float(PINCH_START_THRESHOLD)
+    P_EXIT = float(PINCH_RELEASE_THRESHOLD)
+    DRAG_S = float(DRAG_HOLD_SECONDS)
+    CLICK_CD = float(GESTURE_STABLE_FRAMES * 0.1 + 0.45)
+    SCRL_CD = float(SCROLL_COOLDOWN)
 
-    MOVE  = "Move Cursor"
-    LCLK  = "Left Click"
-    RCLK  = "Right Click"
-    DRAG  = "Drag & Drop"
-    SCRL  = "Scroll"
+    MOVE = "Move Cursor"
+    LCLK = "Left Click"
+    RCLK = "Right Click"
+    DRAG = "Drag & Drop"
+    SCRL = "Scroll"
     PAUSE = "Pause"
-    NONE  = "No hand"
+    NONE = "No hand"
 
     def __init__(self, scroll_speed: int = 5):
         self.scroll_speed = scroll_speed
-        self._pL   = False;  self._pL_t = 0.0
-        self._pR   = False
+        self._pL = False
+        self._pL_t = 0.0
+        self._pR = False
+        self._pR_t = 0.0
         self._drag = False
-        self._t_lc = 0.0;    self._t_rc = 0.0
-        self._sy   = None;   self._st   = 0.0
+        self._t_lc = 0.0
+        self._t_rc = 0.0
+        self._st = 0.0
+        self._scroll_ref_y = None
+        self._scroll_last_time = 0.0
+        self._scroll_state = "IDLE"
+        self._scroll_delta = 0.0
+        self._scroll_velocity = 0.0
+        self._scroll_direction = "NONE"
+        self._current = self.NONE
+        self._history = deque(maxlen=GESTURE_STABLE_FRAMES)
+        self._last_move = 0.0
+
+    def _metrics(self, lms):
+        def dist3(a, b):
+            return math.hypot(a.x - b.x, a.y - b.y)
+
+        palm_size = max(dist3(lms[0], lms[9]), dist3(lms[5], lms[17]), 0.001)
+        thumb_index = dist3(lms[THUMB_TIP], lms[INDEX_TIP]) / palm_size
+        thumb_middle = dist3(lms[THUMB_TIP], lms[MIDDLE_TIP]) / palm_size
+        index_ext = tip_up(lms, INDEX_TIP, INDEX_PIP)
+        middle_ext = tip_up(lms, MIDDLE_TIP, MIDDLE_PIP)
+        ring_ext = tip_up(lms, RING_TIP, RING_PIP)
+        pinky_ext = tip_up(lms, PINKY_TIP, PINKY_PIP)
+        wrist_y = lms[WRIST].y
+        open_palm = index_ext and middle_ext and ring_ext and pinky_ext
+        return {
+            "palm_size": palm_size,
+            "thumb_index": thumb_index,
+            "thumb_middle": thumb_middle,
+            "index_ext": index_ext,
+            "middle_ext": middle_ext,
+            "ring_ext": ring_ext,
+            "pinky_ext": pinky_ext,
+            "open_palm": open_palm,
+            "wrist_y": wrist_y,
+        }
+
+    def _stable_label(self):
+        if not self._history:
+            return self.NONE
+        counts = Counter(self._history)
+        label, _ = counts.most_common(1)[0]
+        return label
+
+    def get_scroll_debug(self):
+        return {
+            "state": self._scroll_state,
+            "delta": round(self._scroll_delta, 4),
+            "velocity": round(self._scroll_velocity, 3),
+            "direction": self._scroll_direction,
+        }
 
     def process(self, lms) -> str:
         now = time.perf_counter()
+        metrics = self._metrics(lms)
+        dL = metrics["thumb_index"]
+        dR = metrics["thumb_middle"]
+        ie = metrics["index_ext"]
+        me = metrics["middle_ext"]
+        re = metrics["ring_ext"]
+        pe = metrics["pinky_ext"]
 
-        ie  = tip_up(lms, INDEX_TIP,  INDEX_PIP)
-        me  = tip_up(lms, MIDDLE_TIP, MIDDLE_PIP)
-        re  = tip_up(lms, RING_TIP,   RING_PIP)
-        pe  = tip_up(lms, PINKY_TIP,  PINKY_PIP)
-        dL  = ldist(lms[THUMB_TIP], lms[INDEX_TIP])
-        dR  = ldist(lms[THUMB_TIP], lms[MIDDLE_TIP])
+        scroll_detected = bool(me and re and not ie and not pe and dL > self.P_EXIT and dR > self.P_EXIT)
+        if DEBUG_MODE:
+            print(f"[SCROLL 1] Gesture detected: {scroll_detected}")
+            print(f"[SCROLL 2] Gesture name: {self.SCRL if scroll_detected else 'NONE'}")
 
-        # 1. FIST
+        if PAUSE_ON_OPEN_PALM and metrics["open_palm"]:
+            self._reset_scroll()
+            self._exit_drag()
+            self._pL = self._pR = False
+            self._history.clear(); self._history.append(self.PAUSE)
+            self._current = self.PAUSE
+            return self.PAUSE
+
         if not ie and not me and not re and not pe and dL > self.P_EXIT and dR > self.P_EXIT:
             self._reset_scroll(); self._exit_drag()
             self._pL = self._pR = False
+            self._history.append(self.PAUSE)
+            self._current = self._stable_label()
             return self.PAUSE
 
-        # 2. SCROLL — index+middle extended, ring+pinky curled, NO pinch
-        # Uses absolute wrist Y to drive continuous scrolling:
-        #   top 30 % of frame  → scroll up   (speed ∝ distance from centre)
-        #   bottom 30 % of frame → scroll down
-        #   middle 40 % dead-zone → no scroll
-        if ie and me and not re and not pe and dL > self.P_EXIT and dR > self.P_EXIT:
+        if scroll_detected:
             self._exit_drag()
-            wy = lms[WRIST].y          # 0 = top of frame, 1 = bottom
-            DEAD_TOP    = 0.30          # above this → scroll up
-            DEAD_BOTTOM = 0.70          # below this → scroll down
+            wy = metrics["wrist_y"]
+            if self._scroll_ref_y is None:
+                self._scroll_ref_y = wy
+                self._scroll_state = "CANDIDATE"
+                self._scroll_delta = 0.0
+                self._scroll_velocity = 0.0
+                self._scroll_direction = "NONE"
+                if DEBUG_MODE:
+                    print(f"[SCROLL 3] Scroll state: {self._scroll_state}")
+                    print(f"[SCROLL 4] Current Y: {wy}")
+                    print("[SCROLL 5] Previous Y: 0.0")
+                    print("[SCROLL 6] Delta Y: 0.0")
+            else:
+                prev_y = self._scroll_ref_y
+                dy = prev_y - wy
+                dt = max(0.016, now - self._scroll_last_time if self._scroll_last_time else 0.016)
+                self._scroll_delta = dy
+                self._scroll_velocity = abs(dy) / dt
+                if dy > 0:
+                    self._scroll_direction = "UP"
+                elif dy < 0:
+                    self._scroll_direction = "DOWN"
+                else:
+                    self._scroll_direction = "NONE"
 
-            if now - self._st > self.SCRL_CD:
-                if wy < DEAD_TOP:
-                    # Hand raised — scroll up; speed ∝ how far above centre
-                    speed = max(1, int((DEAD_TOP - wy) / DEAD_TOP * self.scroll_speed * 2 + 0.5))
-                    pyautogui.scroll(speed, _pause=False)
+                if DEBUG_MODE:
+                    print(f"[SCROLL 3] Scroll state: {'ACTIVE' if abs(dy) > SCROLL_THRESHOLD and now - self._st > self.SCRL_CD else 'INACTIVE'}")
+                    print(f"[SCROLL 4] Current Y: {wy}")
+                    print(f"[SCROLL 5] Previous Y: {prev_y}")
+                    print(f"[SCROLL 6] Delta Y: {dy}")
+                    print(f"[SCROLL 7] Direction: {self._scroll_direction}")
+
+                if abs(dy) > SCROLL_THRESHOLD and now - self._st > self.SCRL_CD:
+                    self._scroll_state = "ACTIVE"
+                    amount = max(1, min(12, int(abs(dy) * 90 + self._scroll_velocity * 2)))
+                    direction = 1 if dy > 0 else -1
+                    if DEBUG_MODE:
+                        print(f"[SCROLL 8] Calculated wheel amount: {direction * amount}")
+                    wheel_ok = send_windows_wheel(direction * amount, debug=DEBUG_MODE)
+                    if DEBUG_MODE and not wheel_ok:
+                        print("[SCROLL 10] Windows wheel event sent: FALSE")
                     self._st = now
-                elif wy > DEAD_BOTTOM:
-                    # Hand lowered — scroll down
-                    speed = max(1, int((wy - DEAD_BOTTOM) / (1 - DEAD_BOTTOM) * self.scroll_speed * 2 + 0.5))
-                    pyautogui.scroll(-speed, _pause=False)
-                    self._st = now
+                    self._scroll_ref_y = wy
+                    self._scroll_last_time = now
+                else:
+                    self._scroll_state = "INACTIVE"
+                    if DEBUG_MODE:
+                        print(f"[SCROLL 3] Scroll state: INACTIVE")
+            self._history.append(self.SCRL)
+            self._current = self._stable_label()
             return self.SCRL
+        self._scroll_state = "IDLE"
+        self._scroll_delta = 0.0
+        self._scroll_velocity = 0.0
+        self._scroll_direction = "NONE"
         self._reset_scroll()
 
-        # 3 + 4. LEFT PINCH → drag or click
         if dL < self.P_ENTER:
             if not self._pL:
-                self._pL   = True
+                self._pL = True
                 self._pL_t = now
             if not self._drag and (now - self._pL_t) >= self.DRAG_S:
                 self._drag = True
                 pyautogui.mouseDown(_pause=False)
-            return self.DRAG if self._drag else self.LCLK
+                self._history.append(self.DRAG)
+                self._current = self._stable_label()
+                return self.DRAG
+            if not self._drag:
+                self._history.append(self.LCLK)
+                self._current = self._stable_label()
+                return self.LCLK
         elif self._pL:
             self._pL = False
             if self._drag:
-                self._exit_drag()
+                pyautogui.mouseUp(_pause=False)
+                self._drag = False
+                self._current = self.MOVE
             elif (now - self._t_lc) > self.CLICK_CD:
-                self._t_lc = now
                 pyautogui.click(_pause=False)
+                self._t_lc = now
+                self._current = self.LCLK
+            self._history.append(self._current)
+            return self._current
 
-        # 5. RIGHT PINCH → right click
         if dR < self.P_ENTER:
-            if not self._pR: self._pR = True
+            if not self._pR:
+                self._pR = True
+                self._pR_t = now
+            self._history.append(self.RCLK)
+            self._current = self._stable_label()
             return self.RCLK
         elif self._pR:
             self._pR = False
             if (now - self._t_rc) > self.CLICK_CD:
-                self._t_rc = now
                 pyautogui.rightClick(_pause=False)
+                self._t_rc = now
+            self._current = self.MOVE
+            self._history.append(self.MOVE)
+            return self.MOVE
 
-        # 6. MOVE
+        self._history.append(self.MOVE)
+        self._current = self._stable_label()
         return self.MOVE
 
-    def _reset_scroll(self): self._sy = None
+    def _reset_scroll(self):
+        self._scroll_ref_y = None
+
     def _exit_drag(self):
         if self._drag:
             pyautogui.mouseUp(_pause=False)
             self._drag = False
-    def cleanup(self): self._exit_drag()
+
+    def cleanup(self):
+        self._exit_drag()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -316,20 +504,17 @@ def draw_scroll_zones(frame):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.32, (80, 80, 80), 1, cv2.LINE_AA)
 
 
-def draw_hud(frame, gesture, conf, fps_v, sens, paused, stats):
+def draw_hud(frame, gesture, conf, fps_v, sens, paused, stats, debug=False, pinch_distance=None, mouse_xy=None, scroll_debug=None):
     h, w = frame.shape[:2]
-    # ── Top bar ──
     ov = frame.copy()
     cv2.rectangle(ov, (0, 0), (w, 28), C_DARK, -1)
     cv2.addWeighted(ov, 0.78, frame, 0.22, 0, frame)
     cv2.putText(frame, "VirtualMouse AI",
                 (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, C_CYAN, 1, cv2.LINE_AA)
-    # Live dot
     lc = C_GREY if paused else C_GREEN
     cv2.circle(frame, (w - 44, 14), 5, lc, -1, cv2.LINE_AA)
     cv2.putText(frame, "PAUSED" if paused else "LIVE",
                 (w - 37, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.36, lc, 1, cv2.LINE_AA)
-    # ── Bottom bar ──
     ov2 = frame.copy()
     cv2.rectangle(ov2, (0, h - 30), (w, h), C_DARK, -1)
     cv2.addWeighted(ov2, 0.78, frame, 0.22, 0, frame)
@@ -342,6 +527,31 @@ def draw_hud(frame, gesture, conf, fps_v, sens, paused, stats):
                     (w - 58, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.36, C_GREEN, 1, cv2.LINE_AA)
         cv2.putText(frame, f"{conf}%",
                     (w - 96, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.36, cc, 1, cv2.LINE_AA)
+
+    if debug:
+        y = 38
+        mouse_text = "n/a"
+        if mouse_xy and mouse_xy[0] is not None and mouse_xy[1] is not None:
+            mouse_text = f"{int(mouse_xy[0])}, {int(mouse_xy[1])}"
+        lines = [
+            f"Gesture: {gesture}",
+            f"Confidence: {conf}%",
+            f"Pinch Distance: {pinch_distance if pinch_distance is not None else 'n/a'}",
+            f"State: {'PAUSED' if paused else 'ACTIVE'}",
+            f"Mouse: {mouse_text}",
+            f"FPS: {fps_v}",
+            f"Sensitivity: {sens:.2f}",
+        ]
+        if scroll_debug:
+            lines.extend([
+                f"Scroll Delta: {scroll_debug.get('delta', 0.0)}",
+                f"Velocity: {scroll_debug.get('velocity', 0.0)}",
+                f"Direction: {scroll_debug.get('direction', 'NONE')}",
+                f"Scroll State: {scroll_debug.get('state', 'IDLE')}",
+            ])
+        for line in lines:
+            cv2.putText(frame, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.34, C_WHITE, 1, cv2.LINE_AA)
+            y += 16
 
 def draw_flash(frame, gesture):
     col = GCOL.get(gesture)
@@ -409,7 +619,7 @@ def ensure_model():
 # Main loop
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run(sensitivity, alpha, scroll_speed, cam_idx):
+def run(sensitivity, alpha, scroll_speed, cam_idx, debug_mode=False):
     ensure_model()
 
     # ── Open camera ──────────────────────────────────────────────────────────
@@ -424,8 +634,8 @@ def run(sensitivity, alpha, scroll_speed, cam_idx):
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS,          30)
 
-    smoother = Smoother(alpha)
-    mapper   = Mapper(sensitivity)
+    smoother = Smoother(alpha=alpha, deadzone=DEAD_ZONE)
+    mapper   = Mapper(sensitivity=SENSITIVITY if sensitivity is None else sensitivity)
     gsm      = GSM(scroll_speed)
 
     # ── Shared state between callback thread and main thread ─────────────────
@@ -450,9 +660,9 @@ def run(sensitivity, alpha, scroll_speed, cam_idx):
         base_options = BaseOptions(model_asset_path=MODEL_PATH),
         running_mode = RunningMode.LIVE_STREAM,
         num_hands    = 1,
-        min_hand_detection_confidence = 0.65,
+        min_hand_detection_confidence = float(MIN_DETECTION_CONFIDENCE),
         min_hand_presence_confidence  = 0.60,
-        min_tracking_confidence       = 0.50,
+        min_tracking_confidence       = float(MIN_TRACKING_CONFIDENCE),
         result_callback = on_result,
     )
     landmarker = HandLandmarker.create_from_options(options)
@@ -516,7 +726,7 @@ def run(sensitivity, alpha, scroll_speed, cam_idx):
     print("    Thumb+Index pinch    → Left click (fires on release)")
     print("    Thumb+Middle pinch   → Right click (fires on release)")
     print("    Hold pinch 0.8 s     → Drag & drop")
-    print("    Index+Middle V up    → Scroll (move hand up / down)")
+    print("    Middle+Ring V up     → Scroll (move hand up / down)")
     print("    Full fist            → Pause cursor")
     print()
     print("  HOTKEYS (type in this terminal window):")
@@ -578,6 +788,7 @@ def run(sensitivity, alpha, scroll_speed, cam_idx):
         gesture = GSM.NONE
         lms     = latest["landmarks"]
         conf    = latest["confidence"]
+        sx = sy = None
 
         if lms and not paused:
             draw_skeleton(frame, lms, fh, fw)
@@ -591,6 +802,7 @@ def run(sensitivity, alpha, scroll_speed, cam_idx):
 
             # Gesture + OS actions
             gesture = gsm.process(lms)
+            scroll_debug = gsm.get_scroll_debug() if gesture == GSM.SCRL else None
 
             if gesture in (GSM.MOVE, GSM.LCLK, GSM.RCLK, GSM.DRAG):
                 pyautogui.moveTo(sx, sy, duration=0, _pause=False)
@@ -599,14 +811,22 @@ def run(sensitivity, alpha, scroll_speed, cam_idx):
             ix, iy = to_px(lms[INDEX_TIP], fw, fh)
             cv2.circle(frame, (ix, iy), 15, C_GREEN, 2, cv2.LINE_AA)
 
-        elif paused:
-            gesture = GSM.PAUSE
+        else:
+            if not paused:
+                gsm.cleanup()
+            scroll_debug = None
+            if paused:
+                gesture = GSM.PAUSE
 
         # ── HUD ──────────────────────────────────────────────────────────────
         if gesture == GSM.SCRL:
             draw_scroll_zones(frame)
+        pinch_distance = None
+        if lms is not None:
+            pinch_distance = float(ldist(lms[THUMB_TIP], lms[INDEX_TIP]) / max(float(ldist(lms[0], lms[9])), 0.001))
         draw_hud(frame, gesture, conf, fps_val,
-                 mapper.sensitivity, paused, show_stats)
+                 mapper.sensitivity, paused, show_stats, debug=debug_mode,
+                 pinch_distance=pinch_distance, mouse_xy=(sx, sy), scroll_debug=scroll_debug)
         draw_flash(frame, gesture)
         cv2.imshow(WIN, frame)
 
@@ -667,9 +887,10 @@ def run(sensitivity, alpha, scroll_speed, cam_idx):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description="VirtualMouse AI — hand gesture OS mouse (MediaPipe 0.10+)")
-    ap.add_argument("--sensitivity",  "-s",  type=float, default=1.5)
-    ap.add_argument("--alpha",        "-a",  type=float, default=0.20)
+    ap.add_argument("--sensitivity",  "-s",  type=float, default=SENSITIVITY)
+    ap.add_argument("--alpha",        "-a",  type=float, default=SMOOTHING_FACTOR)
     ap.add_argument("--scroll-speed", "-sc", type=int,   default=5)
-    ap.add_argument("--camera",       "-c",  type=int,   default=0)
+    ap.add_argument("--camera",       "-c",  type=int,   default=CAMERA_INDEX)
+    ap.add_argument("--debug", action="store_true", default=DEBUG_MODE)
     args = ap.parse_args()
-    run(args.sensitivity, args.alpha, args.scroll_speed, args.camera)
+    run(args.sensitivity, args.alpha, args.scroll_speed, args.camera, debug_mode=args.debug)

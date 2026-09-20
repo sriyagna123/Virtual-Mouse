@@ -1,0 +1,44 @@
+# Configuration for the real Windows virtual mouse controller.
+# Tune these values to improve stability without changing the application behavior.
+
+CAMERA_INDEX = 0
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+
+MIN_DETECTION_CONFIDENCE = 0.65
+MIN_TRACKING_CONFIDENCE = 0.50
+
+# Movement tuning
+MOVE = "Move Cursor"
+MOUSE_SMOOTHING = 0.82
+MOUSE_SENSITIVITY = 1.5
+MOUSE_DEADZONE = 6
+SENSITIVITY = MOUSE_SENSITIVITY
+SMOOTHING_FACTOR = MOUSE_SMOOTHING
+MOVEMENT_SENSITIVITY = MOUSE_SENSITIVITY
+DEAD_ZONE = MOUSE_DEADZONE
+
+# Gesture timing
+GESTURE_STABLE_FRAMES = 3
+GESTURE_CONFIRM_FRAMES = 3
+CLICK_COOLDOWN = 0.55
+DRAG_THRESHOLD = 0.025
+SCROLL_THRESHOLD = 0.020
+SCROLL_SPEED = 5
+SCROLL_INTERVAL = 0.08
+SCROLL_COOLDOWN = 0.08
+
+# Pinch thresholds are normalized by palm size (smaller is tighter/closer pinch)
+PINCH_START_THRESHOLD = 0.30
+PINCH_RELEASE_THRESHOLD = 0.38
+DRAG_HOLD_SECONDS = 0.80
+
+# Safety / pause behavior
+PAUSE_ON_OPEN_PALM = True
+MIN_HAND_SIZE = 0.07
+MAX_HAND_SIZE = 0.90
+DEBUG_MODE = False
+CONTROL_HAND = "Auto"
+
+# Display / debug text
+DEBUG_FPS = True
